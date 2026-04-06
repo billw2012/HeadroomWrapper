@@ -239,12 +239,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <div class="log-section">
   <div class="log-header">
+    <span class="log-title">Token Usage per API Call</span>
+    <span class="refresh-badge" id="graph-call-count"></span>
+    <button onclick="clearGraph()" style="margin-left:auto;font-size:0.7rem;padding:2px 8px;background:var(--card);border:1px solid var(--border);color:var(--muted);border-radius:4px;cursor:pointer">Clear</button>
+  </div>
+  <div style="position:relative;height:220px">
+    <canvas id="token-canvas"></canvas>
+  </div>
+  <div id="turn-summary" style="margin-top:10px;font-size:0.74rem;line-height:1.8;min-height:1.2em"></div>
+  <div style="margin-top:6px;font-size:0.7rem;color:var(--muted)">
+    Each bar = one API call. Bars of the same colour belong to the same user turn (prompt).
+    Input tokens (solid) + output tokens (faded) stacked. Polling every 2 s.
+  </div>
+</div>
+
+<div class="log-section" style="margin-top:14px">
+  <div class="log-header">
     <span class="log-title">Proxy Console Output</span>
     <span class="refresh-badge" id="log-count"></span>
   </div>
   <div class="log-body" id="log-el"></div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
 async function api(path, opts) {
   const r = await fetch('/api/' + path.replace(/^\//,''), opts);
@@ -402,6 +419,163 @@ async function clearCache() {
 
 refresh();
 setInterval(refresh, 30000);
+
+// ---- Token Usage Graph ----
+const TURN_GAP_MS = 12000; // gap between API calls that marks a new user turn
+const TURN_PALETTE = [
+  '#6366f1','#22c55e','#f59e0b','#06b6d4',
+  '#a855f7','#ec4899','#f97316','#84cc16','#ef4444','#14b8a6'
+];
+let callHistory = [];
+let prevInput = null, prevOutput = null;
+let lastCallTime = 0, turnNum = 0;
+let tokenChart = null;
+
+function saveGraphState() {
+  try {
+    localStorage.setItem('hrTokenHistory', JSON.stringify({ callHistory, turnNum, lastCallTime }));
+  } catch {}
+}
+
+function loadGraphState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('hrTokenHistory') || 'null');
+    if (saved && Array.isArray(saved.callHistory)) {
+      callHistory  = saved.callHistory;
+      turnNum      = saved.turnNum      || 0;
+      lastCallTime = saved.lastCallTime || 0;
+    }
+  } catch {}
+}
+
+function initTokenChart() {
+  const ctx = document.getElementById('token-canvas').getContext('2d');
+  tokenChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'Input tokens',  data: [], backgroundColor: [], borderRadius: 3, stack: 'tok' },
+        { label: 'Output tokens', data: [], backgroundColor: [], borderRadius: 3, stack: 'tok' }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: {
+        legend: { labels: { color: '#e2e8f0', font: { size: 11 }, boxWidth: 12 } },
+        tooltip: {
+          callbacks: {
+            title(items) {
+              const c = callHistory[items[0].dataIndex];
+              return `Call #${c.seq} \u00b7 Turn ${c.turn} \u00b7 ${c.ts}`;
+            },
+            label(item) {
+              return `${item.dataset.label}: ${Number(item.raw).toLocaleString()}`;
+            },
+            afterBody(items) {
+              const c = callHistory[items[0].dataIndex];
+              return [`Total: ${Number(c.inputDelta + c.outputDelta).toLocaleString()}`];
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          stacked: true,
+          ticks: { color: '#94a3b8', font: { size: 10 } },
+          grid: { color: '#2d3148' },
+          title: { display: true, text: 'API call (chronological)', color: '#94a3b8', font: { size: 10 } }
+        },
+        y: {
+          stacked: true,
+          ticks: { color: '#94a3b8', font: { size: 10 } },
+          grid: { color: '#2d3148' },
+          title: { display: true, text: 'Tokens', color: '#94a3b8', font: { size: 10 } }
+        }
+      }
+    }
+  });
+}
+
+function renderTokenChart() {
+  if (!tokenChart) return;
+  const inBg = [], outBg = [], labels = [];
+  callHistory.forEach(c => {
+    const col = TURN_PALETTE[(c.turn - 1) % TURN_PALETTE.length];
+    inBg.push(col + 'dd');
+    outBg.push(col + '55');
+    labels.push('#' + c.seq);
+  });
+  tokenChart.data.labels = labels;
+  tokenChart.data.datasets[0].data = callHistory.map(c => c.inputDelta);
+  tokenChart.data.datasets[0].backgroundColor = inBg;
+  tokenChart.data.datasets[1].data = callHistory.map(c => c.outputDelta);
+  tokenChart.data.datasets[1].backgroundColor = outBg;
+  tokenChart.update('none');
+
+  // Turn summary row
+  const turns = {};
+  callHistory.forEach(c => {
+    if (!turns[c.turn]) turns[c.turn] = { calls: 0, tokens: 0 };
+    turns[c.turn].calls++;
+    turns[c.turn].tokens += c.inputDelta + c.outputDelta;
+  });
+  document.getElementById('turn-summary').innerHTML =
+    Object.entries(turns).map(([t, v]) => {
+      const col = TURN_PALETTE[(t - 1) % TURN_PALETTE.length];
+      return `<span style="color:${col};margin-right:16px">\u25a0 Turn ${t}: ` +
+             `${v.calls} call${v.calls > 1 ? 's' : ''}, ` +
+             `${Number(v.tokens).toLocaleString()} tokens</span>`;
+    }).join('');
+
+  document.getElementById('graph-call-count').textContent =
+    callHistory.length + ' call' + (callHistory.length !== 1 ? 's' : '') +
+    ' \u00b7 ' + turnNum + ' turn' + (turnNum !== 1 ? 's' : '');
+}
+
+async function pollTokenMetrics() {
+  try {
+    const text = await fetch('/api/metrics').then(r => r.text());
+    const inM  = text.match(/^headroom_tokens_input_total\s+([\d]+)/m);
+    const outM = text.match(/^headroom_tokens_output_total\s+([\d]+)/m);
+    if (!inM || !outM) return;
+    const curIn  = parseInt(inM[1],  10);
+    const curOut = parseInt(outM[1], 10);
+    if (prevInput === null) { prevInput = curIn; prevOutput = curOut; return; }
+    const dIn  = curIn  - prevInput;
+    const dOut = curOut - prevOutput;
+    if (dIn > 0 || dOut > 0) {
+      const now = Date.now();
+      if (now - lastCallTime > TURN_GAP_MS) turnNum++;
+      lastCallTime = now;
+      callHistory.push({
+        seq: callHistory.length + 1,
+        inputDelta:  Math.max(0, dIn),
+        outputDelta: Math.max(0, dOut),
+        ts:   new Date().toLocaleTimeString(),
+        turn: turnNum
+      });
+      saveGraphState();
+      renderTokenChart();
+    }
+    prevInput  = curIn;
+    prevOutput = curOut;
+  } catch {}
+}
+
+function clearGraph() {
+  callHistory = []; turnNum = 0; lastCallTime = 0;
+  saveGraphState();
+  renderTokenChart();
+}
+
+loadGraphState();
+initTokenChart();
+renderTokenChart();
+pollTokenMetrics();
+setInterval(pollTokenMetrics, 2000);
 </script>
 </body>
 </html>
@@ -480,41 +654,136 @@ def run_dashboard(stop_event: threading.Event) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Windows service class
+# Task Scheduler management (works with Microsoft Store Python)
 # ---------------------------------------------------------------------------
 
-if HAS_WIN32:
-    class HeadroomService(win32serviceutil.ServiceFramework):
-        _svc_name_ = SERVICE_NAME
-        _svc_display_name_ = SERVICE_DISPLAY
-        _svc_description_ = SERVICE_DESC
+TASK_NAME = SERVICE_NAME
 
-        def __init__(self, args):
-            win32serviceutil.ServiceFramework.__init__(self, args)
-            self._wait_event = win32event.CreateEvent(None, 0, 0, None)
-            self._stop_event = threading.Event()
-            self._manager: HeadroomManager | None = None
 
-        def SvcStop(self):
-            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
-            self._stop_event.set()
-            if self._manager:
-                self._manager.stop()
-            win32event.SetEvent(self._wait_event)
+def _pythonw() -> str:
+    """Return path to pythonw.exe next to the current python.exe."""
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if os.path.exists(pythonw):
+        return pythonw
+    # Store Python puts executables in a different location; fall back to python
+    return sys.executable
 
-        def SvcDoRun(self):
-            servicemanager.LogMsg(
-                servicemanager.EVENTLOG_INFORMATION_TYPE,
-                servicemanager.PYS_SERVICE_STARTED,
-                (self._svc_name_, ""),
-            )
-            self._manager = HeadroomManager(self._stop_event)
-            self._manager.start()
-            dash = threading.Thread(
-                target=run_dashboard, args=(self._stop_event,), daemon=True
-            )
-            dash.start()
-            win32event.WaitForSingleObject(self._wait_event, win32event.INFINITE)
+
+def _script() -> str:
+    return os.path.abspath(__file__)
+
+
+def task_install() -> None:
+    pythonw = _pythonw()
+    script = _script()
+    cmd = f'"{pythonw}" "{script}" debug'
+    # Build schtasks XML so we can set restart-on-failure and hidden window
+    xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{SERVICE_DESC}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions>
+    <Exec>
+      <Command>{pythonw}</Command>
+      <Arguments>"{script}" debug</Arguments>
+      <WorkingDirectory>{os.path.dirname(script)}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"""
+    xml_path = os.path.join(os.path.dirname(script), "_task.xml")
+    with open(xml_path, "w", encoding="utf-16") as f:
+        f.write(xml)
+    try:
+        result = subprocess.run(
+            ["schtasks", "/Create", "/TN", TASK_NAME, "/XML", xml_path, "/F"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f"Installed: {TASK_NAME}")
+            print(f"  Runs at logon: {cmd}")
+            print(f"  Dashboard will be at http://127.0.0.1:{DASHBOARD_PORT}")
+        else:
+            print("Failed to install task:")
+            print(result.stderr or result.stdout)
+            sys.exit(1)
+    finally:
+        try:
+            os.remove(xml_path)
+        except OSError:
+            pass
+
+
+def task_start() -> None:
+    result = subprocess.run(
+        ["schtasks", "/Run", "/TN", TASK_NAME],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(f"Started: {TASK_NAME}")
+    else:
+        print("Failed to start task:")
+        print(result.stderr or result.stdout)
+        sys.exit(1)
+
+
+def task_stop() -> None:
+    result = subprocess.run(
+        ["schtasks", "/End", "/TN", TASK_NAME],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(f"Stopped: {TASK_NAME}")
+    else:
+        print("Failed to stop task:")
+        print(result.stderr or result.stdout)
+        sys.exit(1)
+
+
+def task_remove() -> None:
+    result = subprocess.run(
+        ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(f"Removed: {TASK_NAME}")
+    else:
+        print("Failed to remove task:")
+        print(result.stderr or result.stdout)
+        sys.exit(1)
+
+
+def task_status() -> None:
+    result = subprocess.run(
+        ["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "LIST"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(result.stdout)
+    else:
+        print(f"Task '{TASK_NAME}' not found.")
 
 
 # ---------------------------------------------------------------------------
@@ -540,44 +809,24 @@ def run_debug() -> None:
         manager.stop()
 
 
-def print_status() -> None:
-    if not HAS_WIN32:
-        print("pywin32 not available")
-        return
-    try:
-        status = win32serviceutil.QueryServiceStatus(SERVICE_NAME)
-        states = {
-            win32service.SERVICE_STOPPED: "STOPPED",
-            win32service.SERVICE_START_PENDING: "START PENDING",
-            win32service.SERVICE_STOP_PENDING: "STOP PENDING",
-            win32service.SERVICE_RUNNING: "RUNNING",
-            win32service.SERVICE_CONTINUE_PENDING: "CONTINUE PENDING",
-            win32service.SERVICE_PAUSE_PENDING: "PAUSE PENDING",
-            win32service.SERVICE_PAUSED: "PAUSED",
-        }
-        state = states.get(status[1], f"UNKNOWN ({status[1]})")
-        print(f"{SERVICE_NAME}: {state}")
-    except Exception as e:
-        print(f"Service not found or error: {e}")
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+COMMANDS = {
+    "debug":   (run_debug,    "Run in foreground (Ctrl+C to stop)"),
+    "install": (task_install, "Register as a startup task"),
+    "start":   (task_start,   "Start the task now"),
+    "stop":    (task_stop,    "Stop the running task"),
+    "remove":  (task_remove,  "Unregister the startup task"),
+    "status":  (task_status,  "Show task status"),
+}
+
 if __name__ == "__main__":
     args = sys.argv[1:]
-
-    if args and args[0] == "debug":
-        run_debug()
-    elif args and args[0] == "status":
-        print_status()
-    elif HAS_WIN32:
-        win32serviceutil.HandleCommandLine(HeadroomService)
-    else:
-        print("pywin32 is not installed. Install it first:")
-        print("  pip install pywin32")
-        print()
-        print("To test without the service, run:")
-        print("  python headroom_service.py debug")
-        sys.exit(1)
+    if not args or args[0] not in COMMANDS:
+        print("Usage: python headroom_service.py <command>\n")
+        for name, (_, desc) in COMMANDS.items():
+            print(f"  {name:<10} {desc}")
+        sys.exit(0 if not args else 1)
+    COMMANDS[args[0]][0]()
