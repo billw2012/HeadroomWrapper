@@ -246,8 +246,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div style="position:relative;height:220px">
     <canvas id="token-canvas"></canvas>
   </div>
-  <div id="turn-summary" style="margin-top:10px;font-size:0.74rem;line-height:1.8;min-height:1.2em"></div>
-  <div style="margin-top:6px;font-size:0.7rem;color:var(--muted)">
+<div style="margin-top:6px;font-size:0.7rem;color:var(--muted)">
     Each bar = one API call. Bars of the same colour belong to the same user turn (prompt).
     Input tokens (solid) + output tokens (faded) stacked. Polling every 2 s.
   </div>
@@ -514,21 +513,6 @@ function renderTokenChart() {
   tokenChart.data.datasets[1].data = callHistory.map(c => c.outputDelta);
   tokenChart.data.datasets[1].backgroundColor = outBg;
   tokenChart.update('none');
-
-  // Turn summary row
-  const turns = {};
-  callHistory.forEach(c => {
-    if (!turns[c.turn]) turns[c.turn] = { calls: 0, tokens: 0 };
-    turns[c.turn].calls++;
-    turns[c.turn].tokens += c.inputDelta + c.outputDelta;
-  });
-  document.getElementById('turn-summary').innerHTML =
-    Object.entries(turns).map(([t, v]) => {
-      const col = TURN_PALETTE[(t - 1) % TURN_PALETTE.length];
-      return `<span style="color:${col};margin-right:16px">\u25a0 Turn ${t}: ` +
-             `${v.calls} call${v.calls > 1 ? 's' : ''}, ` +
-             `${Number(v.tokens).toLocaleString()} tokens</span>`;
-    }).join('');
 
   document.getElementById('graph-call-count').textContent =
     callHistory.length + ' call' + (callHistory.length !== 1 ? 's' : '') +
