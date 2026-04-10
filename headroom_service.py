@@ -52,6 +52,7 @@ SERVICE_DESC = "Runs the Headroom context optimization proxy and web dashboard."
 
 _log_buffer: deque = deque(maxlen=LOG_BUFFER_SIZE)
 _log_lock = threading.Lock()
+_manager: "HeadroomManager | None" = None
 
 
 def _add_log(line: str) -> None:
@@ -118,6 +119,18 @@ class HeadroomManager(threading.Thread):
                 _add_log(f"[service] Failed to start headroom: {exc}")
                 self.stop_event.wait(backoff)
                 backoff = min(backoff * 2, 60)
+
+    def restart(self) -> None:
+        """Kill the current process; the run loop will auto-restart it."""
+        if self.process and self.process.poll() is None:
+            _add_log("[service] Restarting headroom proxy (user request)...")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        else:
+            _add_log("[service] Restart requested but process not running; will retry shortly.")
 
     def stop(self) -> None:
         if self.process and self.process.poll() is None:
@@ -198,6 +211,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
   <div class="header-actions">
     <span class="refresh-badge" id="ts">Loading...</span>
+    <button class="btn sm" id="restart-btn" onclick="restartService()">Restart Service</button>
     <button class="btn danger sm" onclick="clearCache()">Clear Cache</button>
   </div>
 </div>
@@ -416,6 +430,21 @@ async function clearCache() {
   } catch { alert('Failed to clear cache.'); }
 }
 
+async function restartService() {
+  const btn = document.getElementById('restart-btn');
+  const orig = btn.textContent;
+  btn.textContent = 'Restarting\u2026';
+  btn.disabled = true;
+  try {
+    await fetch('/api/restart', {method:'POST'});
+  } catch {}
+  setTimeout(() => {
+    btn.textContent = orig;
+    btn.disabled = false;
+    refresh();
+  }, 2500);
+}
+
 refresh();
 setInterval(refresh, 30000);
 
@@ -450,12 +479,13 @@ function loadGraphState() {
 function initTokenChart() {
   const ctx = document.getElementById('token-canvas').getContext('2d');
   tokenChart = new Chart(ctx, {
-    type: 'bar',
     data: {
       labels: [],
       datasets: [
-        { label: 'Input tokens',  data: [], backgroundColor: [], borderRadius: 3, stack: 'tok' },
-        { label: 'Output tokens', data: [], backgroundColor: [], borderRadius: 3, stack: 'tok' }
+        { type: 'bar',  label: 'Input tokens',      data: [], backgroundColor: [], borderRadius: 3, stack: 'tok', yAxisID: 'yLeft' },
+        { type: 'bar',  label: 'Output tokens',     data: [], backgroundColor: [], borderRadius: 3, stack: 'tok', yAxisID: 'yLeft' },
+        { type: 'line', label: 'Cumulative tokens', data: [], borderColor: '#94a3b8', backgroundColor: 'transparent',
+          pointRadius: 2, pointHoverRadius: 4, tension: 0.2, borderWidth: 1.5, yAxisID: 'yRight', order: 0 }
       ]
     },
     options: {
@@ -467,7 +497,8 @@ function initTokenChart() {
         tooltip: {
           callbacks: {
             title(items) {
-              const c = callHistory[items[0].dataIndex];
+              const idx = items[0].dataIndex;
+              const c = callHistory[idx];
               return `Call #${c.seq} \u00b7 Turn ${c.turn} \u00b7 ${c.ts}`;
             },
             label(item) {
@@ -475,7 +506,7 @@ function initTokenChart() {
             },
             afterBody(items) {
               const c = callHistory[items[0].dataIndex];
-              return [`Total: ${Number(c.inputDelta + c.outputDelta).toLocaleString()}`];
+              return [`Per-call total: ${Number(c.inputDelta + c.outputDelta).toLocaleString()}`];
             }
           }
         }
@@ -487,11 +518,20 @@ function initTokenChart() {
           grid: { color: '#2d3148' },
           title: { display: true, text: 'API call (chronological)', color: '#94a3b8', font: { size: 10 } }
         },
-        y: {
+        yLeft: {
+          type: 'linear',
+          position: 'left',
           stacked: true,
           ticks: { color: '#94a3b8', font: { size: 10 } },
           grid: { color: '#2d3148' },
-          title: { display: true, text: 'Tokens', color: '#94a3b8', font: { size: 10 } }
+          title: { display: true, text: 'Tokens / call', color: '#94a3b8', font: { size: 10 } }
+        },
+        yRight: {
+          type: 'linear',
+          position: 'right',
+          ticks: { color: '#64748b', font: { size: 10 } },
+          grid: { drawOnChartArea: false },
+          title: { display: true, text: 'Cumulative', color: '#64748b', font: { size: 10 } }
         }
       }
     }
@@ -507,11 +547,14 @@ function renderTokenChart() {
     outBg.push(col + '55');
     labels.push('#' + c.seq);
   });
+  let running = 0;
+  const cumulative = callHistory.map(c => { running += c.inputDelta + c.outputDelta; return running; });
   tokenChart.data.labels = labels;
   tokenChart.data.datasets[0].data = callHistory.map(c => c.inputDelta);
   tokenChart.data.datasets[0].backgroundColor = inBg;
   tokenChart.data.datasets[1].data = callHistory.map(c => c.outputDelta);
   tokenChart.data.datasets[1].backgroundColor = outBg;
+  tokenChart.data.datasets[2].data = cumulative;
   tokenChart.update('none');
 
   document.getElementById('graph-call-count').textContent =
@@ -579,7 +622,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self) -> None:
-        if self.path.startswith("/api/"):
+        if self.path == "/api/restart":
+            if _manager is not None:
+                _manager.restart()
+            data = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path.startswith("/api/"):
             self._proxy_post(self.path[5:])
         else:
             self.send_error(404)
@@ -779,8 +831,10 @@ def run_debug() -> None:
     print(f"  Proxy port : {HEADROOM_PORT}")
     print(f"  Dashboard  : http://127.0.0.1:{DASHBOARD_PORT}")
     print(f"  Ctrl+C to stop\n")
+    global _manager
     stop_event = threading.Event()
     manager = HeadroomManager(stop_event)
+    _manager = manager
     manager.start()
     dash = threading.Thread(target=run_dashboard, args=(stop_event,), daemon=True)
     dash.start()
